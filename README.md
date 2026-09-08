@@ -24,7 +24,8 @@ to know what. This project reimplements the same idea with those layers removed:
 - **Detection.** Blur, differencing, thresholding, and morphology are written as
   explicit loops over the pixel data — roughly 400 lines of C, no OpenCV dependency.
 - **Encoding.** This is the one stage that is delegated. Raw frames are piped to an
-  FFmpeg child process, which uses the Pi's hardware H.264 encoder.
+  FFmpeg child process, which uses the Pi's hardware H.264 encoder (`h264_v4l2m2m`)
+  when one is usable and falls back to `libx264` otherwise.
 
 ## Overview
 
@@ -46,7 +47,7 @@ to know what. This project reimplements the same idea with those layers removed:
   recorder    fork/exec ffmpeg, write raw frames to its stdin
       │
       ▼
-  clip.mp4 + still image
+  clip.mp4 and/or a .jpg still  (which of the two, per --mode)
 ```
 
 The ring buffer exists because detection is inherently late: by the time the score
@@ -69,10 +70,19 @@ sudo usermod -aG video "$USER"   # log out and back in
 ## Building and running
 
 ```bash
-git clone https://github.com/RaphaelShrestha/pi-motion-cam.git
-cd pi-motion-cam
-make
+git clone https://github.com/RaphaelShrestha/Pi_Motion_Cam.git
+cd Pi_Motion_Cam
+make                 # -> build/pi-motion-cam
+make test            # build and run the detector tests (no camera needed)
 ```
+
+`make DEBUG=1` builds unoptimised with symbols; `make NEON=1` enables the
+vectorised inner loops (Pi only). `make install PREFIX=/usr/local` copies the
+binary to `$PREFIX/bin`.
+
+On the first recording FFmpeg is probed for a working H.264 encoder: it prefers
+the hardware `h264_v4l2m2m`, warns and falls back to `libx264` if that does not
+actually encode, and honours `PMC_ENCODER` in the environment as an override.
 
 Confirm what the camera actually supports before choosing a resolution — mine
 advertised modes it could not sustain:
@@ -90,10 +100,13 @@ Then:
 Output is quiet apart from motion events:
 
 ```
-[21:07:02] started — /dev/video0, 640x480 @ 15fps, YUYV
-[21:09:41] motion  score=4.7%  → captures/2026-03-14/210941.mp4
-[21:10:03] stopped after 22.1s
+[21:07:02] started - /dev/video0, 640x480 @ 15fps, YUYV
+[21:09:41] motion  score=4.7%  -> captures/2026-03-14/210941.mp4
+[21:10:03] stopped after 22.1s (331 frames)
 ```
+
+Logging goes to stderr. A clip that hits `--max-duration` is stopped with a
+`- duration cap` note; `--mode stills` logs `-> …210941.jpg` instead.
 
 `SIGINT` and `SIGTERM` are handled so that the in-flight clip is finalized and
 buffers released before exit.
@@ -103,21 +116,28 @@ buffers released before exit.
 | Flag | Default | Description |
 |---|---|---|
 | `--device` | `/dev/video0` | Capture device |
-| `--resolution` | `640x480` | Capture size |
-| `--fps` | `15` | Requested frame rate |
-| `--output` | `./captures` | Output directory |
+| `--resolution` | `640x480` | Capture size, `WxH`; both dimensions must be even |
+| `--fps` | `15` | Requested frame rate (1–120) |
+| `--output` | `./captures` | Output directory; files land in `<output>/<YYYY-MM-DD>/` |
+| `--mode` | `both` | `video`, `stills`, or `both` |
 | `--threshold` | `25` | Per-pixel intensity delta that counts as changed (0–255) |
-| `--sensitivity` | `1.5` | Percentage of changed pixels required to trigger |
-| `--min-frames` | `3` | Consecutive triggering frames required |
-| `--cooldown` | `5` | Seconds of quiet before recording stops |
-| `--preroll` | `3` | Seconds retained from before the trigger |
-| `--downscale` | `2` | Run detection at 1/N resolution; recording is unaffected |
+| `--sensitivity` | `1.5` | Percentage of changed pixels required to trigger (0–100) |
+| `--min-frames` | `3` | Consecutive triggering frames required (≥1) |
+| `--cooldown` | `5` | Seconds of quiet before recording stops (≥0) |
+| `--preroll` | `3` | Seconds retained from before the trigger (0–30) |
+| `--max-duration` | `120` | Hard cap on a single clip, seconds (≥1) |
+| `--downscale` | `2` | Run detection at 1/N resolution; recording is unaffected (1–16) |
 | `--learning-rate` | `0.05` | Background adaptation rate (0–1) |
-| `--mask` | — | PBM file marking regions to ignore |
-| `--verbose` | off | Per-frame scores on stderr |
+| `--mask` | — | PBM file (P1 or P4) marking regions to ignore |
+| `--config`, `-c` | — | INI file to read before flags are applied |
+| `--verbose`, `-v` | off | Per-frame scores on stderr |
+| `--help`, `-h` | — | Print the usage summary and exit |
 
-The same options can be set in `~/.config/pi-motion-cam/config.ini` under
-`[capture]`, `[detection]`, and `[recording]`.
+The same settings can live in an INI file — `~/.config/pi-motion-cam/config.ini`
+by default, or wherever `--config` points. Command-line flags override it, and a
+template is included as [config.ini](config.ini). Keys use underscores
+(`min_frames`, `learning_rate`, `max_duration`); the `[capture]`, `[detection]`
+and `[recording]` section headers are cosmetic and ignored by the parser.
 
 ## Detection algorithm
 
@@ -133,9 +153,10 @@ For each frame:
 5. **Threshold** into a binary mask: `M = D > threshold`
 6. **Morphological open** (3×3 erode, then dilate) to remove isolated speckle while
    preserving the shape of larger moving regions.
-7. **Score** as the fraction of set pixels in the mask.
-8. **Trigger** when the score exceeds `sensitivity` for `min-frames` consecutive
-   frames.
+7. **Score** as the percentage of set mask pixels, counted over the considered
+   region only — the whole frame, or the part left visible by `--mask`.
+8. **Trigger** once the score is at least `sensitivity` for `min-frames`
+   consecutive frames.
 9. **Update the background** as an exponential moving average:
    `B ← (1−α)·B + α·frame`
 
@@ -171,14 +192,18 @@ still mid-clip is not absorbed into the model.
 
 ## Structure
 
+All sources sit in the repo root; each `.c` has a matching `.h` apart from
+`main.c` and `test_motion.c`.
+
 ```
-src/
-  main.c           argument parsing, main loop, signal handling
-  v4l2_capture.c   device open, format negotiation, mmap buffer queue
-  motion.c         blur, difference, threshold, morphology, scoring
-  ringbuf.c        pre-roll frame buffer
-  recorder.c       ffmpeg child process and pipe management
-  config.c         ini parsing
+main.c            argument parsing, capture loop, signal handling
+v4l2_capture.c    device open, format negotiation, mmap buffer queue
+motion.c          downscale, blur, difference, threshold, morphology, scoring
+ringbuf.c         pre-roll frame buffer
+recorder.c        ffmpeg child process, clip and snapshot output
+config.c          defaults, INI parsing, command-line parsing
+log.c             timestamped logging to stderr
+test_motion.c     detector and ring-buffer tests (make test)
 ```
 
 `motion.c` has no dependency on V4L2 — it takes a grayscale buffer and its
@@ -186,12 +211,12 @@ dimensions. That separation was initially incidental, but it made the detector
 testable against synthetic frame sequences rather than requiring me to move in front
 of the camera for every change.
 
-## Possible extensions
+## Tests
 
-- MJPEG capture, to fit higher resolutions within the available USB bandwidth
-- Connected-component labeling to identify and bound the regions that moved
-- Notification on motion events rather than files on disk alone
-- Automatic threshold adjustment for day and night conditions
+`make test` links `test_motion.c` against everything except `main.o` and runs it.
+The cases cover a static scene, a moving object, the consecutive-frame debounce, a
+gradual lighting ramp being absorbed rather than reported, speckle rejection, and
+the ring buffer's wrap-around behaviour. No camera required.
 
 ## License
 
